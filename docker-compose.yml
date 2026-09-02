@@ -1,0 +1,61 @@
+# Real-Time Sports Commentary Service
+#
+#   docker compose up --build
+#
+# Starts two containers:
+#   * mock-sports-api : controllable stand-in for the upstream provider so the
+#                       stack is fully demonstrable without an API key.
+#   * app             : the commentary service itself (SSE on /events).
+#
+# Point `EXTERNAL_API_URL` at a real provider in `.env` to use live data.
+
+services:
+  mock-sports-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sports-mock-api
+    command: ["node", "dist/mock/server.js"]
+    environment:
+      MOCK_API_PORT: "4000"
+      MOCK_EVENT_INTERVAL_SECONDS: "20"
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sports-commentary-service
+    depends_on:
+      mock-sports-api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "${PORT:-3000}"
+      EXTERNAL_API_URL: "${EXTERNAL_API_URL:-http://mock-sports-api:4000}"
+      API_KEY: "${API_KEY:-demo-api-key}"
+      POLLING_INTERVAL_SECONDS: "${POLLING_INTERVAL_SECONDS:-10}"
+      RATE_LIMIT_MAX_REQUESTS: "${RATE_LIMIT_MAX_REQUESTS:-10}"
+      RATE_LIMIT_WINDOW_SECONDS: "${RATE_LIMIT_WINDOW_SECONDS:-60}"
+      CIRCUIT_BREAKER_FAILURE_THRESHOLD: "${CIRCUIT_BREAKER_FAILURE_THRESHOLD:-3}"
+      CIRCUIT_BREAKER_OPEN_SECONDS: "${CIRCUIT_BREAKER_OPEN_SECONDS:-60}"
+      SSE_KEEPALIVE_SECONDS: "${SSE_KEEPALIVE_SECONDS:-20}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
