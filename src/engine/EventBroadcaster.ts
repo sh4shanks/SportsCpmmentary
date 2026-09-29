@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto';
 import {
   formatSseComment,
   formatSseMessage,
+  type CommentaryStyle,
   type MatchEvent,
+  type SseFormatOptions,
 } from '../models/MatchEvent';
 import type { ILogger } from '../utils/logger';
 import { SilentLogger } from '../utils/logger';
@@ -18,14 +20,21 @@ export interface SseSink {
   end(): void;
 }
 
+export interface SseClientOptions {
+  readonly matchId?: string;
+  readonly format?: 'commentary' | 'legacy';
+  readonly style?: CommentaryStyle;
+}
+
 export interface SseClient {
   readonly id: string;
   readonly connectedAt: number;
   readonly sink: SseSink;
+  readonly options?: SseClientOptions;
 }
 
 export interface IEventBroadcaster {
-  register(sink: SseSink): SseClient;
+  register(sink: SseSink, options?: SseClientOptions): SseClient;
   unregister(clientId: string): void;
   broadcast(event: MatchEvent): number;
   sendComment(comment: string): void;
@@ -40,7 +49,8 @@ export interface EventBroadcasterOptions {
 
 /**
  * Fan-out hub: every detected match event is written to every connected SSE
- * client. Dead sockets are pruned lazily on the first failed write.
+ * client, optionally filtered by matchId and formatted as requested.
+ * Dead sockets are pruned lazily on the first failed write.
  */
 export class EventBroadcaster implements IEventBroadcaster {
   private readonly clients = new Map<string, SseClient>();
@@ -57,11 +67,12 @@ export class EventBroadcaster implements IEventBroadcaster {
     return this.clients.size;
   }
 
-  register(sink: SseSink): SseClient {
+  register(sink: SseSink, options?: SseClientOptions): SseClient {
     const client: SseClient = {
       id: randomUUID(),
       connectedAt: Date.now(),
       sink,
+      options,
     };
 
     this.clients.set(client.id, client);
@@ -69,6 +80,8 @@ export class EventBroadcaster implements IEventBroadcaster {
 
     this.logger.info('SSE client connected', {
       clientId: client.id,
+      matchIdFilter: options?.matchId ?? 'all',
+      format: options?.format ?? 'legacy',
       clients: this.clients.size,
     });
 
@@ -87,10 +100,32 @@ export class EventBroadcaster implements IEventBroadcaster {
     }
   }
 
-  /** Writes the event to every client. Returns how many clients received it. */
+  /** Writes the event to matching clients. Returns how many clients received it. */
   broadcast(event: MatchEvent): number {
-    const message = formatSseMessage(event);
-    const delivered = this.writeToAll(message);
+    let delivered = 0;
+
+    for (const client of [...this.clients.values()]) {
+      if (client.options?.matchId && client.options.matchId !== event.matchId) {
+        continue;
+      }
+
+      const formatOptions: SseFormatOptions = {
+        format: client.options?.format ?? 'legacy',
+        style: client.options?.style,
+      };
+
+      const message = formatSseMessage(event, formatOptions);
+      try {
+        client.sink.write(message);
+        delivered += 1;
+      } catch (error) {
+        this.logger.warn('Dropping unwritable SSE client', {
+          clientId: client.id,
+          error: toErrorMessage(error),
+        });
+        this.unregister(client.id);
+      }
+    }
 
     this.logger.info('Broadcast match event', {
       eventId: event.id,

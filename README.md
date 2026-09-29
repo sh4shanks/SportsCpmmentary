@@ -1,459 +1,234 @@
-# Real-Time Sports Commentary Service
+# Sports Commentary Service
 
-A production-ready backend that polls a live sports API, detects significant match
-incidents (goals, cards, substitutions) by diffing successive snapshots, and pushes
-them to subscribers in real time over **Server-Sent Events**.
+### Real-Time Sports Intelligence & Commentary Engine
 
-It is built around the three resilience concerns that make or break this class of
-service: **concurrency** (one worker per match), **rate limiting** (a global budget
-shared by every worker), and **circuit breaking** (per-match failure isolation).
+A production-grade, highly resilient sports event streaming, commentary generation, and monitoring platform built on Node.js, TypeScript, and Fastify.
 
-| | |
-|---|---|
-| **Language / runtime** | TypeScript (strict) on Node.js 20+ |
-| **Framework** | Fastify 4 |
-| **Validation** | Zod |
-| **Testing** | Jest + Supertest, against a controllable mock provider |
-| **Packaging** | Docker + Docker Compose |
+The service monitors sports matches across upstream providers, detects in-match incidents (goals, yellow/red cards, substitutions) by diffing successive snapshots, translates them into human-readable narrative commentary across multiple broadcast styles, and streams them in real time over **Server-Sent Events (SSE)** to an interactive **Live Match Center**.
 
 ---
 
-## Table of contents
-
-- [Architecture](#architecture)
-- [Folder structure](#folder-structure)
-- [Quick start with Docker](#quick-start-with-docker)
-- [Running locally](#running-locally)
-- [Environment variables](#environment-variables)
-- [API documentation](#api-documentation)
-- [How it works](#how-it-works)
-  - [Concurrency model](#concurrency-model)
-  - [Rate limiter](#rate-limiter)
-  - [Circuit breaker](#circuit-breaker)
-  - [Change detection](#change-detection)
-- [Testing](#testing)
-- [Design notes](#design-notes)
-
----
-
-## Architecture
+## 1. End-to-End Architecture
 
 ```
-                                 ┌──────────────────────────────┐
-   client ──── GET /events ────▶ │      SSE Endpoint            │
-   client ──── GET /events ────▶ │   (hijacked long-lived HTTP) │
+                    ┌────────────────────────────────────────────────────────┐
+                    │               LIVE MATCH CENTER DASHBOARD              │
+                    │         HTML / CSS / Live SSE Commentary Feed          │
+                    └───────────────────────────▲────────────────────────────┘
+                                                │ text/event-stream (SSE)
+                                                │ ?format=commentary&style=...
+                                 ┌──────────────┴───────────────┐
+   Subscriber ── GET /events ──▶ │      SSE Stream Gateway      │
+                                 │   (hijacked HTTP connection) │
                                  └──────────────┬───────────────┘
-                                                │ register / unregister
+                                                │ register / filter / unregister
                                                 ▼
                                  ┌──────────────────────────────┐
-                                 │     Event Broadcaster        │
-                                 │  fan-out + 20s keep-alive    │
+                                 │      Event Broadcaster       │
+                                 │  fan-out + 20s keep-alives   │
                                  └──────────────▲───────────────┘
                                                 │ broadcast(MatchEvent)
                                  ┌──────────────┴───────────────┐
-                                 │     Change Detector          │
+                                 │      Commentary Engine       │
+                                 │  narrative templates + styles│
+                                 │  severity + momentum + summary
+                                 └──────────────▲───────────────┘
+                                                │ MatchEvent
+                                 ┌──────────────┴───────────────┐
+                                 │       Change Detector        │
                                  │  previous snapshot ⟷ current │
                                  └──────────────▲───────────────┘
                                                 │ diff
-                       ┌────────────────────────┴───────────────┐
-                       │        In-Memory State Manager         │
-                       │        Map<matchId, MatchSnapshot>     │
-                       └────────────────────────▲───────────────┘
+                        ┌───────────────────────┴────────────────┐
+                        │        In-Memory State Manager         │
+                        │      Snapshots + Match Timelines       │
+                        └───────────────────────▲────────────────┘
                                                 │ get / set
-   POST/GET/DELETE                ┌─────────────┴────────────────┐
-   /watch/matches  ─────────────▶ │       Polling Manager        │
-                                  │  1 worker per matchId, no    │
-                                  │  duplicates, clean shutdown  │
-                                  └───┬──────────┬──────────┬────┘
-                                      │          │          │
-                             ┌────────▼──┐ ┌─────▼─────┐ ┌──▼────────┐
-                             │ Worker A  │ │ Worker B  │ │ Worker N  │
-                             │ ┌───────┐ │ │ ┌───────┐ │ │ ┌───────┐ │
-                             │ │Breaker│ │ │ │Breaker│ │ │ │Breaker│ │   ← per-match state
-                             │ └───┬───┘ │ │ └───┬───┘ │ │ └───┬───┘ │
-                             └─────┼─────┘ └─────┼─────┘ └─────┼─────┘
-                                   └─────────────┼─────────────┘
-                                                 ▼
-                                  ┌──────────────────────────────┐
-                                  │  Global Rate Limiter         │   ← shared, 10 calls / 60s
-                                  │  token bucket, FIFO waiters  │
-                                  └──────────────┬───────────────┘
-                                                 ▼
-                                  ┌──────────────────────────────┐
-                                  │  Sports API Client           │
-                                  │  normalises provider payload │
-                                  └──────────────┬───────────────┘
-                                                 ▼
-                                       External Sports API
-                                  (mock container, or e.g.
-                                   football-data.org / ESPN)
-```
-
-**Data flow:** `POST /watch/matches` → manager starts a worker → worker asks its
-breaker for permission → waits for a rate-limiter token → fetches the match →
-client normalises the payload → detector diffs it against the stored snapshot →
-new events are broadcast to every SSE subscriber.
-
----
-
-## Folder structure
-
-```
-sports-commentary-service/
-├── src/
-│   ├── api/
-│   │   ├── controllers/
-│   │   │   ├── HealthController.ts      # GET /health
-│   │   │   ├── EventsController.ts      # GET /events (SSE)
-│   │   │   └── WatchController.ts       # /watch/matches CRUD + validation
-│   │   ├── middleware/
-│   │   │   ├── errorHandler.ts          # JSON-only error boundary + 404 handler
-│   │   │   └── requestLogger.ts         # structured request logging hooks
-│   │   └── routes/
-│   │       ├── health.ts
-│   │       ├── events.ts
-│   │       └── watch.ts
-│   ├── clients/
-│   │   └── SportsApiClient.ts           # ISportsApiClient + HTTP implementation
-│   ├── config/
-│   │   └── env.ts                       # Zod-validated configuration
-│   ├── engine/
-│   │   ├── PollingManager.ts            # worker lifecycle, watchlist ownership
-│   │   ├── PollingWorker.ts             # one async polling loop per match
-│   │   ├── RateLimiter.ts               # global token bucket
-│   │   ├── CircuitBreaker.ts            # CLOSED / OPEN / HALF_OPEN state machine
-│   │   ├── StateManager.ts              # in-memory snapshot repository
-│   │   ├── ChangeDetector.ts            # snapshot diffing → domain events
-│   │   └── EventBroadcaster.ts          # SSE client registry + fan-out
-│   ├── mock/
-│   │   ├── MockSportsApiServer.ts       # controllable fake provider
-│   │   └── server.ts                    # standalone runner (compose service)
-│   ├── models/
-│   │   ├── MatchEvent.ts                # public event contract + SSE serializer
-│   │   ├── MatchSnapshot.ts             # normalised internal match model
-│   │   └── WatchMatch.ts                # watchlist request/response schemas
-│   ├── utils/
-│   │   ├── errors.ts                    # typed error hierarchy
-│   │   ├── logger.ts                    # ILogger + JSON console logger
-│   │   └── time.ts                      # Clock abstraction + abortable delay
-│   ├── app.ts                           # composition root / Fastify factory
-│   └── server.ts                        # process entrypoint, graceful shutdown
-├── tests/
-│   ├── helpers/testHarness.ts           # app+mock bootstrap, SSE test client
-│   ├── mock/mockSportsApi.ts            # fixtures and mock controls
-│   └── integration/
-│       ├── health.test.ts
-│       ├── watch.test.ts
-│       ├── events.test.ts
-│       ├── ratelimit.test.ts
-│       └── circuitbreaker.test.ts
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── jest.config.js
-├── tsconfig.json
-├── tsconfig.build.json
-├── instructions.md
-└── package.json
+   REST API             ┌───────────────────────┴────────────────┐
+   /watch/matches ────▶ │        Polling Manager                 │
+                        │   1:1 worker-to-match, deduplication,  │
+                        │   clean lifecycle & state eviction     │
+                        └───┬──────────┬──────────┬──────────────┘
+                            │          │          │
+                   ┌────────▼──┐ ┌─────▼─────┐ ┌──▼────────┐
+                   │ Worker A  │ │ Worker B  │ │ Worker N  │
+                   │ ┌───────┐ │ │ ┌───────┐ │ │ ┌───────┐ │
+                   │ │Breaker│ │ │ │Breaker│ │ │ │Breaker│ │   ← Per-match Circuit Breakers
+                   │ └───┬───┘ │ │ └───┬───┘ │ │ └───┬───┘ │     (CLOSED/OPEN/HALF-OPEN)
+                   └─────┼─────┴─┴─────┼─────┴─┴─────┼─────┘
+                         └─────────────┼─────────────┘
+                                       │ acquire() [FIFO promise-chain token bucket]
+                        ┌──────────────▼───────────────┐
+                        │     Global Rate Limiter      │  ← Strict sliding-window rate limit
+                        └──────────────┬───────────────┘    (shared across all workers)
+                                       │
+                                       ▼
+                        ┌──────────────────────────────┐
+                        │      Sports API Provider     │
+                        │   (Live API or In-Process    │
+                        │    MockSportsApiServer)      │
+                        └──────────────────────────────┘
 ```
 
 ---
 
-## Quick start with Docker
+## 2. Why Each Component Exists
 
+1. **Global Rate Limiter (`RateLimiter.ts`)**:
+   Upstream sports data providers impose strict rate limits (e.g. 10 requests per 60-second sliding window). If 15 workers independently polled their matches every 5 seconds, they would generate 180 requests/minute and receive HTTP 429 penalties. The Global Rate Limiter coordinates all concurrent polling workers using a FIFO promise chain with sliding-window token regeneration and interval pacing to prevent micro-bursts.
+
+2. **Concurrent Polling Workers (`PollingWorker.ts`) & Polling Manager (`PollingManager.ts`)**:
+   Maintains a strict 1:1 worker-to-match ratio. Each worker owns an independent polling loop with graceful cancellation via `AbortController`. Duplicate watch requests are ignored, and removing a match stops its loop and flushes its cached state.
+
+3. **Per-Match Circuit Breakers (`CircuitBreaker.ts`)**:
+   If an upstream match endpoint returns `503 Service Unavailable`, times out, or errors out, an isolated circuit breaker trips (`CLOSED -> OPEN -> HALF_OPEN -> CLOSED`). When `OPEN`, the worker fails fast *before* acquiring a rate limiter token. This guarantees zero rate limit tokens are wasted on failing fixtures and ensures a broken match never degrades healthy matches.
+
+4. **In-Memory State Repository & Match Timelines (`StateManager.ts`)**:
+   Maintains the latest snapshot of each match along with a chronological timeline of detected incidents. Timelines reset cleanly on process restart or match unwatch without requiring an external database.
+
+5. **Change Detector (`ChangeDetector.ts`)**:
+   Establishes an initial silent baseline on first poll to prevent replaying historic match goals. On subsequent polls, it diffs incoming provider data against the cached baseline to detect goals, yellow cards, red cards, and substitutions.
+
+6. **Commentary Engine (`CommentaryEngine.ts`)**:
+   Translates raw structured events into contextual, human-readable commentary narratives. Supports three deterministic broadcast styles (`standard`, `concise`, `professional`), categorizes event severity (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`), calculates engine-generated match momentum, and produces full-time match summaries.
+
+7. **Event Broadcaster (`EventBroadcaster.ts`) & SSE Gateway (`EventsController.ts`)**:
+   Maintains long-lived HTTP Server-Sent Events connections using `reply.hijack()`, proxy unbuffering headers (`X-Accel-Buffering: no`), and periodic 20-second heartbeats (`: keep-alive`). Supports match-filtering (`?matchId=...`) and rich commentary formatting (`?format=commentary`).
+
+8. **Live Match Center (`RootController.ts`)**:
+   A comprehensive real-time dashboard featuring multi-match scoreboards, momentum indicators, full-time summaries, live commentary feed with client-side filtering, interactive upstream match simulator, and complete observability telemetry.
+
+---
+
+## 3. Commentary Engine & Broadcast Styles
+
+The **Commentary Engine** supports deterministic, offline-capable templates:
+
+| Event Type | Severity | Standard Style | Concise Style | Professional Broadcast Style |
+|---|---|---|---|---|
+| **GOAL** | `CRITICAL` | `GOAL! Arsenal take the lead through Bukayo Saka in the 67th minute! (2-1)` | `67' — GOAL Arsenal. Bukayo Saka (2-1).` | `Arsenal move ahead following a successful attacking sequence finished by Bukayo Saka in minute 67 (2-1).` |
+| **RED CARD** | `HIGH` | `RED CARD! Enzo Fernandez (Chelsea) is sent off in the 82nd minute!` | `82' — RED CARD Enzo Fernandez (Chelsea).` | `Chelsea are reduced to 10 players as Enzo Fernandez receives a straight red card in minute 82.` |
+| **YELLOW CARD** | `MEDIUM` | `YELLOW CARD! Reece James (Chelsea) receives a booking in the 45th minute.` | `45' — YELLOW CARD Reece James (Chelsea).` | `Reece James of Chelsea is shown a yellow card by the referee for a disciplinary infraction in minute 45.` |
+| **SUBSTITUTION** | `LOW` | `SUBSTITUTION: Arsenal bring on Gabriel Jesus to replace Kai Havertz in the 60th minute.` | `60' — SUB Arsenal: Gabriel Jesus on for Kai Havertz.` | `Arsenal execute a tactical alteration: Gabriel Jesus enters the pitch in place of Kai Havertz (minute 60).` |
+
+### Extensible Event Severity Hierarchy
+* `CRITICAL`: Goals, match suspensions
+* `HIGH`: Red cards, penalties, VAR reviews
+* `MEDIUM`: Yellow cards, full-time whistle, match resumptions
+* `LOW`: Substitutions, corners, offsides, injuries, kickoff, half-time
+
+---
+
+## 4. Match Momentum & Full-Time Summaries
+
+### Engine-Generated Momentum
+* Clearly labeled: **"Engine-generated momentum"**
+* Calculated purely from actual detected events:
+  * Baseline: 50% / 50%
+  * Goal: +25% for scoring team, -25% for conceding team
+  * Red card: -30% penalty for penalized team
+  * Yellow card: -8% penalty for booked team
+  * Substitution: +4% tactical lift for substituting team
+  * Score margin: +5% per goal advantage
+  * Clamped to 10% - 90% bounded range
+
+### Full-Time Summaries
+When a match reaches `FINISHED` or `FULL_TIME`:
+* Final scoreline & victor headline
+* List of all goals with minutes and scorers
+* Total cards (yellow and red)
+* Total substitutions executed
+* Total verified incident count
+
+---
+
+## 5. API Reference
+
+| Method | Endpoint | Description | Sample Command |
+|---|---|---|---|
+| `GET` | `/` | Live Match Center & Operations Console | `curl http://localhost:3000/` |
+| `GET` | `/health` | Lightweight liveness probe & connection counts | `curl http://localhost:3000/health` |
+| `GET` | `/stats` | Telemetry: metrics, rate limiter, circuit breakers, watchlist & momentum | `curl http://localhost:3000/stats` |
+| `GET` | `/events` | Server-Sent Events stream (legacy format) | `curl -N http://localhost:3000/events` |
+| `GET` | `/events?format=commentary` | SSE stream with rich commentary payload | `curl -N "http://localhost:3000/events?format=commentary"` |
+| `GET` | `/events?matchId=match-123` | SSE stream filtered to a single match | `curl -N "http://localhost:3000/events?matchId=match-123"` |
+| `GET` | `/watch/matches` | List watched match IDs | `curl http://localhost:3000/watch/matches` |
+| `POST` | `/watch/matches` | Add matches to watch (`{"matchIds": [...]}`) | `curl -X POST http://localhost:3000/watch/matches -H "Content-Type: application/json" -d '{"matchIds":["match-123"]}'` |
+| `DELETE` | `/watch/matches` | Remove matches from watch (`{"matchIds": [...]}`) | `curl -X DELETE http://localhost:3000/watch/matches -H "Content-Type: application/json" -d '{"matchIds":["match-123"]}'` |
+| `POST` | `/simulation/event` | Inject incident into upstream mock provider | `curl -X POST http://localhost:3000/simulation/event -H "Content-Type: application/json" -d '{"matchId":"match-123","type":"goal"}'` |
+| `POST` | `/simulation/status` | Update match status on upstream provider | `curl -X POST http://localhost:3000/simulation/status -H "Content-Type: application/json" -d '{"matchId":"match-123","status":"FINISHED"}'` |
+| `POST` | `/simulation/failure` | Inject upstream HTTP 503 failure (breaker test) | `curl -X POST http://localhost:3000/simulation/failure -H "Content-Type: application/json" -d '{"matchId":"match-123","status":503}'` |
+| `DELETE` | `/simulation/failure` | Clear upstream failure (breaker recovery) | `curl -X DELETE "http://localhost:3000/simulation/failure?matchId=match-123"` |
+
+---
+
+## 6. Example Server-Sent Events
+
+### Commentary Format (`GET /events?format=commentary`)
+```http
+id: match-123:goal:goal-1
+event: goal
+data: {"eventId":"match-123:goal:goal-1","matchId":"match-123","type":"GOAL","severity":"CRITICAL","minute":67,"team":"Arsenal","commentary":"GOAL! Arsenal take the lead through Bukayo Saka in the 67th minute! (2-1)","timestamp":"2026-09-29T12:00:00.000Z"}
+```
+
+### Legacy Format (`GET /events` - Backwards Compatible)
+```http
+id: match-123:goal:goal-1
+event: goal
+data: {"matchId":"match-123","team":"Arsenal","player":"Bukayo Saka","minute":67,"score":"2-1"}
+```
+
+---
+
+## 7. Installation & Running
+
+### Prerequisites
+* Node.js >= 20.0.0
+* npm >= 9.0.0
+* (Optional) Docker & Docker Compose
+
+### Local Development
+```bash
+npm install
+npm run build
+npm run dev
+```
+In development mode, the service automatically boots an embedded mock sports API server on port 4000 if no external provider is running and pre-watches default fixture `match-123`.
+
+Visit `http://localhost:3000` to open the **Live Match Center**.
+
+### Running Standalone Mock Provider
+```bash
+# Terminal 1 - Mock Sports API on port 4000
+npm run mock
+
+# Terminal 2 - Commentary Service on port 3000
+npm start
+```
+
+### Running with Docker Compose
 ```bash
 docker compose up --build
 ```
-
-This starts two containers:
-
-| Service | Port | Purpose |
-|---|---|---|
-| `app` | 3000 | the commentary service |
-| `mock-sports-api` | 4000 | a controllable fake provider that scripts a live match |
-
-The mock appends a new incident to `match-123` every 20 seconds, so the stack is
-fully demonstrable without any third-party API key:
-
-```bash
-# terminal 1 – subscribe
-curl -N http://localhost:3000/events
-
-# terminal 2 – start following the scripted match
-curl -X POST http://localhost:3000/watch/matches \
-  -H 'Content-Type: application/json' \
-  -d '{"matchIds":["match-123"]}'
-```
-
-Within a couple of polling intervals, terminal 1 starts printing events:
-
-```
-: connected
-id: match-123:goal:e1
-event: goal
-data: {"matchId":"match-123","team":"Arsenal","player":"Bukayo Saka","minute":12,"score":"1-0"}
-
-: keep-alive
-```
-
-Wait for the health check to report ready before hitting the API:
-
-```bash
-docker compose up -d --wait
-docker compose ps        # app should be "healthy"
-```
-
-To point the service at a real provider instead, set `EXTERNAL_API_URL` and
-`API_KEY` in `.env` before starting.
+Spawns two containers:
+1. `mock-sports-api` on port 4000
+2. `app` on port 3000
 
 ---
 
-## Running locally
+## 8. Verification & Testing
 
-```bash
-npm install
-
-cp .env.example .env     # optional; sensible defaults are built in
-
-npm run mock             # terminal 1 – fake provider on :4000
-npm run dev              # terminal 2 – service on :3000 with hot reload
-
-npm test                 # integration suite
-npm run build && npm start   # production build
-```
-
----
-
-## Environment variables
-
-Every variable is validated by Zod at start-up; an invalid value fails fast with a
-readable message instead of surfacing as a mysterious runtime error.
-
-| Variable | Default | Description |
-|---|---|---|
-| `PORT` | `3000` | HTTP port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `NODE_ENV` | `development` | `development` \| `test` \| `production` |
-| `EXTERNAL_API_URL` | `http://localhost:4000` | Base URL of the sports provider |
-| `API_KEY` | *(empty)* | Sent as `X-Auth-Token` and `Authorization: Bearer` |
-| `HTTP_TIMEOUT_MS` | `5000` | Per-request upstream timeout |
-| `POLLING_INTERVAL_SECONDS` | `10` | Interval between polls of a single match |
-| `RATE_LIMIT_MAX_REQUESTS` | `10` | Global request budget per window |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate-limit window length |
-| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `3` | Consecutive failures that trip a breaker |
-| `CIRCUIT_BREAKER_OPEN_SECONDS` | `60` | Backoff before a half-open probe |
-| `SSE_KEEPALIVE_SECONDS` | `20` | Keep-alive comment interval |
-| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` \| `silent` |
-
----
-
-## API documentation
-
-### `GET /health`
-
-```bash
-curl -s http://localhost:3000/health
-```
-
-```json
-{ "status": "ok", "uptimeSeconds": 42, "watching": 2, "sseClients": 1 }
-```
-
-### `GET /events` — Server-Sent Events stream
-
-Response headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
-`Connection: keep-alive`.
-
-```bash
-curl -N http://localhost:3000/events
-```
-
-Event frames follow the SSE specification exactly:
-
-```
-id: match-123:goal:e1
-event: goal
-data: {"matchId":"match-123","team":"Arsenal","player":"Bukayo Saka","minute":12,"score":"1-0"}
-
-id: match-123:card:e2
-event: card
-data: {"matchId":"match-123","team":"Chelsea","player":"Reece James","minute":23,"cardType":"yellow"}
-
-id: match-123:substitution:e4
-event: substitution
-data: {"matchId":"match-123","team":"Arsenal","playerIn":"Gabriel Jesus","playerOut":"Kai Havertz","minute":61}
-```
-
-Browser usage:
-
-```js
-const source = new EventSource('http://localhost:3000/events');
-source.addEventListener('goal', (e) => console.log('GOAL', JSON.parse(e.data)));
-source.addEventListener('card', (e) => console.log('CARD', JSON.parse(e.data)));
-source.addEventListener('substitution', (e) => console.log('SUB', JSON.parse(e.data)));
-```
-
-### `POST /watch/matches` → `202 Accepted`
-
-```bash
-curl -i -X POST http://localhost:3000/watch/matches \
-  -H 'Content-Type: application/json' \
-  -d '{"matchIds":["match-123","match-456"]}'
-```
-
-```json
-{
-  "accepted": ["match-123", "match-456"],
-  "alreadyWatching": [],
-  "watching": ["match-123", "match-456"]
-}
-```
-
-### `GET /watch/matches` → `200 OK`
-
-```bash
-curl -s http://localhost:3000/watch/matches
-```
-
-```json
-{ "watching": ["match-123", "match-456"] }
-```
-
-### `DELETE /watch/matches` → `204 No Content`
-
-```bash
-curl -i -X DELETE http://localhost:3000/watch/matches \
-  -H 'Content-Type: application/json' \
-  -d '{"matchIds":["match-123"]}'
-```
-
-### Errors
-
-Every failure — validation, malformed JSON, unknown route, unexpected exception —
-is returned as JSON, never HTML:
-
-```json
-{
-  "error": "Invalid request body",
-  "details": [{ "path": "matchIds", "message": "matchIds is required" }]
-}
-```
-
----
-
-## How it works
-
-### Concurrency model
-
-`PollingManager` owns a `Map<matchId, PollingWorker>`, which structurally
-guarantees the "exactly one worker per match" rule — adding the same id twice is a
-no-op, reported back as `alreadyWatching`.
-
-Each worker is an independent `async` loop:
-
-```
-while (!aborted) {
-  breaker.execute(async () => {
-    await rateLimiter.acquire(signal);   // global budget
-    return apiClient.fetchMatch(matchId, signal);
-  });
-  → detect changes → broadcast → store snapshot
-  await delay(POLLING_INTERVAL, signal); // cancellable sleep
-}
-```
-
-Cancellation is cooperative and uses an `AbortController` per worker, so
-`DELETE /watch/matches` (and process shutdown) interrupts an in-flight sleep or a
-queued rate-limit wait immediately, rather than after up to a minute.
-
-### Rate limiter
-
-A single `TokenBucketRateLimiter` instance is shared by every worker, so the limit
-is global rather than per-match.
-
-The twist compared with a naive bucket: **a token consumed at time `t` is returned
-at exactly `t + window`**, instead of refilling the whole bucket on a fixed
-schedule. Fixed-window refills permit a double burst across a boundary (10 calls at
-59s plus 10 at 61s = 20 calls inside a 60 second *sliding* window). With
-per-consumption regeneration, no sliding window can ever contain more than
-`RATE_LIMIT_MAX_REQUESTS` requests — which is exactly the property the tests
-assert.
-
-Waiters are served strictly FIFO via a promise chain, so a worker cannot be starved
-by later arrivals, and every wait is abortable.
-
-### Circuit breaker
-
-One breaker instance per worker, so a dead match cannot slow down a healthy one.
-
-```
-CLOSED ──3 consecutive failures──▶ OPEN ──60s elapsed──▶ HALF_OPEN
-   ▲                                 ▲                      │
-   └────── probe succeeds ───────────┴─── probe fails ──────┘
-```
-
-While `OPEN` the breaker fails fast: the operation is never invoked, so no upstream
-request is made **and no rate-limiter token is consumed** — the budget stays
-available for matches that are actually working. In `HALF_OPEN` exactly one probe
-is admitted; success resets the failure count and closes the circuit, failure
-re-opens it and restarts the timer.
-
-Worker cancellation is explicitly excluded from the failure count, so stopping a
-worker never trips its breaker.
-
-### Change detection
-
-The first poll of a match only establishes a baseline — otherwise every goal
-already scored would be replayed as breaking news. Afterwards, `ChangeDetector`
-compares timeline entries by a stable key (provider id when available, otherwise
-type + minute + team + players) and emits anything new, sorted by minute.
-
-A fallback covers providers that expose only an aggregate score: if the score moved
-but no goal appeared on the timeline, a synthetic goal event is emitted so clients
-still learn about it.
-
----
-
-## Testing
+The test suite runs with Jest in-band against ephemeral mock sports servers:
 
 ```bash
 npm test
 ```
 
-The suite runs against a real HTTP mock of the provider (`MockSportsApiServer`),
-so the client, worker, breaker and limiter are all exercised over the wire rather
-than stubbed out.
-
-| Spec | What it proves |
-|---|---|
-| `health.test.ts` | `200 {"status":"ok"}`, JSON 404s, production defaults are 10/60s and 3 failures/60s |
-| `watch.test.ts` | 202 / 200 / 204 contract, no duplicate workers, concurrent polling of two matches, removal stops the loop, invalid payloads → JSON 400 |
-| `events.test.ts` | SSE headers, goal **and** card **and** substitution delivery to a live subscriber, multi-client fan-out, no replay of historic incidents, disconnect cleanup |
-| `ratelimit.test.ts` | 15 workers produce exactly 10 upstream calls; no 60s sliding window exceeds the budget; tokens regenerate one window later; queued waits abort cleanly |
-| `circuitbreaker.test.ts` | Exactly 3 attempts, silence for the whole backoff, exactly one half-open probe, recovery, failure isolation between matches, full state machine on a fake clock |
-
-Timers are compressed via config overrides (e.g. a 2 second backoff instead of 60)
-so the suite finishes in seconds; the production defaults themselves are asserted
-separately in `health.test.ts`.
-
----
-
-## Design notes
-
-- **Clean architecture / SOLID.** Every collaborator is an interface
-  (`IRateLimiter`, `ICircuitBreaker`, `ISportsApiClient`, `IMatchStateRepository`,
-  `IChangeDetector`, `IEventBroadcaster`, `IPollingManager`, `ILogger`) injected
-  through constructors. `src/app.ts` is the only place where concrete classes are
-  wired together, which is what makes the test harness a one-liner.
-- **Repository pattern** for match state: swapping the in-memory `Map` for Redis to
-  scale horizontally touches one class and nothing else.
-- **Provider-agnostic boundary.** `SportsApiClient` normalises upstream payloads
-  into `MatchSnapshot`, and `ChangeDetector` emits a fixed public contract, so the
-  SSE stream is unaffected by provider quirks.
-- **Injected clock.** `CircuitBreaker` and `TokenBucketRateLimiter` take a `Clock`,
-  making their time-dependent behaviour testable without waiting a real minute.
-- **Graceful shutdown.** `SIGINT`/`SIGTERM` close the Fastify server, abort every
-  worker and end every SSE connection, so containers stop instantly.
-- **Security hygiene.** Match ids are schema-restricted before being interpolated
-  into upstream URLs, the runtime image drops to the non-root `node` user, and
-  5xx responses never leak internals to the client.
+### Test Coverage (7 Suites, 42 Tests Passing)
+1. **`commentary.test.ts` (11 tests)**: Commentary generation across all styles, severity classification, match momentum calculation, full-time summaries, timeline storage, SSE commentary payload, match filtering, and end-to-end simulation.
+2. **`circuitbreaker.test.ts` (4 tests)**: Failure threshold trips, backoff timeout, half-open probe, recovery, and isolation between matches.
+3. **`ratelimit.test.ts` (6 tests)**: Strict 10 requests / 60s sliding window compliance across concurrent workers, single-window regeneration, queue abortion, capacity=1 limits, and race condition immunity.
+4. **`watch.test.ts` (5 tests)**: Watchlist CRUD (202, 200, 204), duplicate worker rejection, concurrent polling loops, and worker shutdown.
+5. **`events.test.ts` (7 tests)**: SSE streaming headers, score change goal broadcasts, card broadcasts, substitution broadcasts, multi-client fan-out, silent baseline validation, and client disconnect cleanup.
+6. **`stats.test.ts` (3 tests)**: Operational telemetry, worker states, and incident counters.
+7. **`health.test.ts` (6 tests)**: Liveness probe, subscriber counting, JSON 404 responses, production default configurations, and HTML / JSON root dashboard responses.

@@ -1,0 +1,6 @@
+{
+  "name": "Sports Commentary Service",
+  "description": "Real-time sports commentary service with SSE streaming, concurrent polling workers, global rate limiting, and circuit breakers.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

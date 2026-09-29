@@ -141,6 +141,15 @@ export class MockSportsApiServer {
     });
   }
 
+  /** Update match status, e.g. 'IN_PLAY', 'HALF_TIME', 'FINISHED', 'FULL_TIME'. */
+  setStatus(matchId: string, status: string): void {
+    const fixture = this.fixtures.get(matchId) ?? createFixture(matchId);
+    this.fixtures.set(matchId, {
+      ...fixture,
+      status,
+    });
+  }
+
   /** Force every request for `matchId` to fail with `status` (null clears it). */
   setFailure(matchId: string, status: number | null): void {
     if (status === null) {
@@ -184,6 +193,12 @@ export class MockSportsApiServer {
     // Control plane
     if (segments[0] === '_control') {
       await this.handleControl(method, segments, url, req, res);
+      return;
+    }
+
+    // GET /matches
+    if (method === 'GET' && segments[0] === 'matches' && !segments[1]) {
+      this.json(res, 200, { matches: [...this.fixtures.values()] });
       return;
     }
 
@@ -237,6 +252,36 @@ export class MockSportsApiServer {
       const body = (await readJsonBody(req)) as Partial<MockMatchFixture> | null;
       this.setMatch(createFixture(id, { ...(body ?? {}), matchId: id }));
       this.json(res, 200, this.fixtures.get(id));
+      return;
+    }
+
+    if ((method === 'POST' || method === 'PUT') && resource === 'events' && id) {
+      const body = (await readJsonBody(req)) as Partial<MockTimelineEntry> | null;
+      const fixture = this.fixtures.get(id) ?? createFixture(id);
+      const type = (body?.type as 'goal' | 'card' | 'substitution') ?? 'goal';
+      const entry: MockTimelineEntry = {
+        id: body?.id ?? `e-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type,
+        team: body?.team ?? fixture.homeTeam,
+        minute: body?.minute ?? Math.min(90, fixture.minute + 3),
+        player: body?.player ?? (type === 'goal' ? 'Bukayo Saka' : 'Player'),
+        playerIn: body?.playerIn,
+        playerOut: body?.playerOut,
+        cardType: body?.cardType ?? (type === 'card' ? 'yellow' : undefined),
+      };
+      this.addEvent(id, entry);
+      this.json(res, 200, { matchId: id, event: entry, fixture: this.fixtures.get(id) });
+      return;
+    }
+
+    if ((method === 'POST' || method === 'PUT') && (resource === 'status' || resource === 'end') && id) {
+      const body = (await readJsonBody(req)) as { status?: string } | null;
+      const status =
+        resource === 'end'
+          ? 'FINISHED'
+          : (url.searchParams.get('status') ?? body?.status ?? 'FINISHED');
+      this.setStatus(id, status);
+      this.json(res, 200, { matchId: id, status, fixture: this.fixtures.get(id) });
       return;
     }
 

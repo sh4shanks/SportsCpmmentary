@@ -117,4 +117,32 @@ describe('Global rate limiting', () => {
 
     await expect(queued).rejects.toThrow(/aborted/i);
   });
+
+  it('correctly tracks capacity=1 limiter', async () => {
+    const clock = new FakeClock(0);
+    const limiter = new TokenBucketRateLimiter({ capacity: 1, windowMs: 10_000, clock });
+
+    expect(limiter.availableTokens).toBe(1);
+    await limiter.acquire();
+    expect(limiter.availableTokens).toBe(0);
+
+    clock.advance(9_999);
+    expect(limiter.availableTokens).toBe(0);
+
+    clock.advance(1);
+    expect(limiter.availableTokens).toBe(1);
+  });
+
+  it('handles simultaneous acquire calls safely without exceeding capacity', async () => {
+    const clock = new FakeClock(0);
+    const limiter = new TokenBucketRateLimiter({ capacity: 3, windowMs: 30_000, clock });
+
+    // 3 concurrent acquires
+    await Promise.all([limiter.acquire(), limiter.acquire(), limiter.acquire()]);
+    expect(limiter.availableTokens).toBe(0);
+
+    // After 30s, first token regenerates
+    clock.advance(30_000);
+    expect(limiter.availableTokens).toBe(1);
+  });
 });

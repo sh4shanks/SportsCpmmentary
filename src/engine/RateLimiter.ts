@@ -91,12 +91,18 @@ export class TokenBucketRateLimiter implements IRateLimiter {
         this.prune();
 
         if (this.consumedAt.length < this.capacity) {
-          this.consumedAt.push(this.clock.now());
+          const last =
+            this.consumedAt.length > 0
+              ? (this.consumedAt[this.consumedAt.length - 1] as number)
+              : -Infinity;
+          const interval = Math.max(1, Math.floor(this.windowMs / this.capacity));
+          const timestamp = Math.max(this.clock.now(), last + interval);
+          this.consumedAt.push(timestamp);
           return;
         }
 
         const oldest = this.consumedAt[0] as number;
-        const waitMs = Math.max(1, oldest + this.windowMs - this.clock.now());
+        const waitMs = Math.max(1, oldest + this.windowMs - this.clock.now() + 5);
         await delay(waitMs, signal);
       }
     } finally {

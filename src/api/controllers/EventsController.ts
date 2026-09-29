@@ -1,7 +1,14 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
-import type { IEventBroadcaster } from '../../engine/EventBroadcaster';
+import type { IEventBroadcaster, SseClientOptions } from '../../engine/EventBroadcaster';
+import type { CommentaryStyle } from '../../models/MatchEvent';
 import type { ILogger } from '../../utils/logger';
 import { toErrorMessage } from '../../utils/errors';
+
+interface EventsQuery {
+  matchId?: string;
+  format?: 'commentary' | 'legacy';
+  style?: CommentaryStyle;
+}
 
 /**
  * `GET /events` – Server-Sent Events stream.
@@ -9,6 +16,11 @@ import { toErrorMessage } from '../../utils/errors';
  * Fastify's reply lifecycle is bypassed with `reply.hijack()` so the raw socket
  * stays open for the lifetime of the subscription and the broadcaster can write
  * to it at any time.
+ *
+ * Supports optional query parameters:
+ *   - `matchId`: filter events to a specific match
+ *   - `format`: "commentary" for enriched narrative events or "legacy" (default)
+ *   - `style`: "standard" | "concise" | "professional"
  */
 export class EventsController {
   constructor(
@@ -36,12 +48,22 @@ export class EventsController {
     raw.write(`retry: ${this.retryMs}\n\n`);
     raw.write(': connected\n\n');
 
-    const client = this.broadcaster.register({
-      write: (chunk: string): boolean => raw.write(chunk),
-      end: (): void => {
-        raw.end();
+    const query = (request.query ?? {}) as EventsQuery;
+    const clientOptions: SseClientOptions = {
+      matchId: query.matchId,
+      format: query.format === 'commentary' ? 'commentary' : 'legacy',
+      style: query.style,
+    };
+
+    const client = this.broadcaster.register(
+      {
+        write: (chunk: string): boolean => raw.write(chunk),
+        end: (): void => {
+          raw.end();
+        },
       },
-    });
+      clientOptions,
+    );
 
     let released = false;
     const release = (): void => {

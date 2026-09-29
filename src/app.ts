@@ -11,10 +11,15 @@ import {
 } from './engine/PollingManager';
 import { TokenBucketRateLimiter, type IRateLimiter } from './engine/RateLimiter';
 import { InMemoryStateManager, type IMatchStateRepository } from './engine/StateManager';
+import { MetricsCollector, type IMetricsCollector } from './engine/MetricsCollector';
+import { CommentaryEngine, type ICommentaryEngine } from './engine/CommentaryEngine';
 import { registerErrorHandlers } from './api/middleware/errorHandler';
 import { registerRequestLogging } from './api/middleware/requestLogger';
 import { eventsRoutes } from './api/routes/events';
 import { healthRoutes } from './api/routes/health';
+import { rootRoutes } from './api/routes/root';
+import { statsRoutes } from './api/routes/stats';
+import { simulationRoutes } from './api/routes/simulation';
 import { watchRoutes } from './api/routes/watch';
 import { createLogger, type ILogger } from './utils/logger';
 import { secondsToMs } from './utils/time';
@@ -27,8 +32,10 @@ export interface AppDependencies {
   rateLimiter: IRateLimiter;
   stateRepository: IMatchStateRepository;
   changeDetector: IChangeDetector;
+  commentaryEngine: ICommentaryEngine;
   broadcaster: IEventBroadcaster;
   pollingManager: IPollingManager;
+  metrics: IMetricsCollector;
 }
 
 declare module 'fastify' {
@@ -72,6 +79,8 @@ export function createDependencies(options: BuildAppOptions = {}): AppDependenci
 
   const stateRepository = options.dependencies?.stateRepository ?? new InMemoryStateManager();
   const changeDetector = options.dependencies?.changeDetector ?? new ChangeDetector();
+  const commentaryEngine =
+    options.dependencies?.commentaryEngine ?? new CommentaryEngine();
 
   const broadcaster =
     options.dependencies?.broadcaster ??
@@ -79,6 +88,8 @@ export function createDependencies(options: BuildAppOptions = {}): AppDependenci
       keepAliveMs: secondsToMs(config.sseKeepAliveSeconds),
       logger: logger.child({ component: 'EventBroadcaster' }),
     });
+
+  const metrics = options.dependencies?.metrics ?? new MetricsCollector();
 
   const pollingManager =
     options.dependencies?.pollingManager ??
@@ -91,8 +102,10 @@ export function createDependencies(options: BuildAppOptions = {}): AppDependenci
         rateLimiter,
         stateRepository,
         changeDetector,
+        commentaryEngine,
         broadcaster,
         logger,
+        metrics,
       }),
     });
 
@@ -103,8 +116,10 @@ export function createDependencies(options: BuildAppOptions = {}): AppDependenci
     rateLimiter,
     stateRepository,
     changeDetector,
+    commentaryEngine,
     broadcaster,
     pollingManager,
+    metrics,
   };
 }
 
@@ -128,7 +143,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   registerRequestLogging(app, deps.logger);
   registerErrorHandlers(app, deps.logger);
 
+  await app.register(rootRoutes);
   await app.register(healthRoutes);
+  await app.register(statsRoutes);
+  await app.register(simulationRoutes);
   await app.register(eventsRoutes);
   await app.register(watchRoutes);
 

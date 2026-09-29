@@ -1,10 +1,12 @@
 import type { ISportsApiClient } from '../clients/SportsApiClient';
 import type { IChangeDetector } from './ChangeDetector';
 import { CircuitBreaker, CircuitState } from './CircuitBreaker';
+import type { ICommentaryEngine } from './CommentaryEngine';
 import type { IEventBroadcaster } from './EventBroadcaster';
 import { PollingWorker, type IPollingWorker } from './PollingWorker';
 import type { IRateLimiter } from './RateLimiter';
 import type { IMatchStateRepository } from './StateManager';
+import type { IMetricsCollector } from './MetricsCollector';
 import { isAbortError, toErrorMessage } from '../utils/errors';
 import type { ILogger } from '../utils/logger';
 import { secondsToMs } from '../utils/time';
@@ -23,6 +25,8 @@ export interface IPollingManager {
   list(): string[];
   isWatching(matchId: string): boolean;
   circuitStateOf(matchId: string): CircuitState | undefined;
+  getWorker(matchId: string): IPollingWorker | undefined;
+  getAllWorkers(): Array<{ matchId: string; worker: IPollingWorker }>;
   readonly workerCount: number;
   stopAll(): Promise<void>;
 }
@@ -136,6 +140,17 @@ export class PollingManager implements IPollingManager {
     return this.workers.get(matchId)?.circuitState;
   }
 
+  getWorker(matchId: string): IPollingWorker | undefined {
+    return this.workers.get(matchId);
+  }
+
+  getAllWorkers(): Array<{ matchId: string; worker: IPollingWorker }> {
+    return Array.from(this.workers.entries()).map(([matchId, worker]) => ({
+      matchId,
+      worker,
+    }));
+  }
+
   async stopAll(): Promise<void> {
     const workers = [...this.workers.values()];
     this.workers.clear();
@@ -161,8 +176,10 @@ export interface DefaultWorkerFactoryDependencies {
   rateLimiter: IRateLimiter;
   stateRepository: IMatchStateRepository;
   changeDetector: IChangeDetector;
+  commentaryEngine?: ICommentaryEngine;
   broadcaster: IEventBroadcaster;
   logger: ILogger;
+  metrics?: IMetricsCollector;
 }
 
 /**
@@ -194,8 +211,10 @@ export function createDefaultWorkerFactory(
         circuitBreaker,
         stateRepository: deps.stateRepository,
         changeDetector: deps.changeDetector,
+        commentaryEngine: deps.commentaryEngine,
         broadcaster: deps.broadcaster,
         logger: deps.logger,
+        metrics: deps.metrics,
       },
     );
   };

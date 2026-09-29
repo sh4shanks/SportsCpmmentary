@@ -53,4 +53,30 @@ describe('GET /health', () => {
     expect(config.circuitBreakerFailureThreshold).toBe(3);
     expect(config.circuitBreakerOpenSeconds).toBe(60);
   });
+
+  describe('GET / (Root overview route)', () => {
+    it('returns 200 with HTML dashboard by default', async () => {
+      const response = await request(harness.app.server).get('/');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('text/html');
+      expect(response.text).toContain('Sports Commentary Service');
+      expect(response.text).toContain('/health');
+      expect(response.text).toContain('/events');
+    });
+
+    it('returns 200 with JSON overview when Accept is application/json', async () => {
+      const response = await request(harness.app.server)
+        .get('/')
+        .set('Accept', 'application/json');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toContain('application/json');
+      expect(response.body).toMatchObject({
+        name: 'sports-commentary-service',
+        status: 'ok',
+        endpoints: expect.any(Array),
+      });
+    });
+  });
 });
